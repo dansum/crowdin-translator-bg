@@ -1524,7 +1524,7 @@ function injectButtons() {
     display:'flex', flexDirection:'column', gap:'10px', alignItems:'flex-end',
   });
 
-  const allBtn = makeBtn('⚡ Translate All', 'linear-gradient(135deg,#059669,#0d9488)', translateAll);
+  const allBtn = makeBtn('⚡ Translate All', 'linear-gradient(135deg,#16a34a,#dc2626)', translateAll);
   const singleBtn = makeBtn('🌐 Translate This', 'linear-gradient(135deg,#4f46e5,#7c3aed)', translateThis);
 
   group.appendChild(allBtn);
