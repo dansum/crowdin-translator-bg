@@ -1,13 +1,13 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="bg">
 <head>
   <meta charset="UTF-8" />
-  <title>KA Crowdin Translator</title>
+  <title>KA Crowdin Translator BG</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      width: 330px;
+      width: 360px;
       background: #fff;
       color: #1a1a2e;
     }
@@ -88,23 +88,36 @@
       text-transform: uppercase; letter-spacing: 0.5px;
     }
     details .inner { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+    .check { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: #374151; line-height: 1.4; text-transform: none; letter-spacing: 0; font-weight: 400; }
+    .check input { margin-top: 2px; }
+    .check .cost { font-size: 10px; color: #b45309; font-weight: 600; }
+    .section-title { font-size: 12px; font-weight: 700; color: #1a1a2e; margin-bottom: 2px; }
+    .corr-list { max-height: 150px; overflow-y: auto; border: 1px solid #f0f0f0; border-radius: 6px; font-size: 12px; }
+    .corr-item { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 4px 8px; border-bottom: 1px solid #f5f5f5; }
+    .corr-item:last-child { border-bottom: none; }
+    .corr-item button { border: none; background: none; color: #9ca3af; cursor: pointer; font-size: 12px; }
+    .corr-item .star { color: #d97706; }
+    .mini-row { display: flex; gap: 6px; flex-wrap: wrap; }
+    .mini-btn { padding: 5px 9px; border: 1.5px solid #e0e0e0; border-radius: 6px; background: #fff; font-size: 11px; font-weight: 600; color: #374151; cursor: pointer; }
+    .stats { font-size: 12px; color: #374151; line-height: 1.6; }
+    .stats b { color: #1a1a2e; }
   </style>
 </head>
 <body>
   <div class="header">
-    <div class="header-title">⚡ KA Crowdin Translator</div>
-    <div class="header-sub">AI-powered translation for Khan Academy</div>
+    <div class="header-title">⚡ KA Crowdin Translator BG</div>
+    <div class="header-sub">Превод с ИИ за Кан Академия · българска версия</div>
   </div>
   <div class="body">
     <div>
-      <label>Target Language</label>
+      <label>Целеви език</label>
       <select id="language">
         <!-- populated by popup.js -->
       </select>
     </div>
     <div class="divider"></div>
     <div>
-      <label>AI Provider</label>
+      <label>ИИ доставчик</label>
       <select id="aiProvider">
         <option value="gemini">Google Gemini</option>
         <option value="openai">OpenAI</option>
@@ -113,50 +126,116 @@
       <div class="hint" id="providerHint"></div>
     </div>
     <div>
-      <label>API Key</label>
-      <input type="password" id="apiKey" placeholder="Paste your API key" autocomplete="off" />
+      <label>API ключ</label>
+      <input type="password" id="apiKey" placeholder="Постави API ключа си" autocomplete="off" />
       <div class="hint">
-        Stored per provider — switch providers and your keys are remembered.
-        Leave blank to use free Google Translate (lower quality).
+        Пази се отделно за всеки доставчик — при смяна ключовете се помнят.
+        Без ключ се ползва безплатният Google Translate (по-ниско качество, без проверките по-долу).
       </div>
     </div>
     <div>
-      <label>Glossary URL <span class="opt">(optional, recommended)</span></label>
-      <input type="text" id="glossaryUrl" placeholder="https://… plain-text URL with term pairs" />
+      <label>Речник (URL) <span class="opt">(по избор, препоръчително)</span></label>
+      <input type="text" id="glossaryUrl" placeholder="https://… текстов файл с двойки термини" />
       <div class="hint">
-        Your team's approved terminology — one <code>English | Translation</code> pair per line.
-        Fetched fresh every hour, so glossary updates reach all translators automatically.
+        Одобрената терминология на екипа — по една двойка <code>English | Превод</code> на ред.
+        Изтегля се наново на всеки час.
       </div>
     </div>
-    <details>
-      <summary>Advanced</summary>
+
+    <details open>
+      <summary>Български правила</summary>
       <div class="inner">
         <div>
-          <label>Model override <span class="opt">(optional)</span></label>
-          <input type="text" id="aiModel" placeholder="blank = provider default" />
-          <div class="hint">e.g. gemini-2.5-pro, gpt-4o, claude-sonnet-4-5</div>
+          <label>Обръщение към ученика</label>
+          <select id="bgAddress">
+            <option value="ti">„ти“ — Намери, Избери, твоят отговор</option>
+            <option value="vie">„Вие“ — Намерете, Изберете, Вашият отговор</option>
+          </select>
+        </div>
+        <label class="check"><input type="checkbox" id="bgFixQuotes" /> <span>Кавички „…“ вместо "…" <span class="hint">(локално, без жетони)</span></span></label>
+        <label class="check"><input type="checkbox" id="bgMathLocale" /> <span>Десетична запетая във формулите: <code>$3.5$</code> → <code>$3{,}5$</code>, <code>$12{,}000$</code> → <code>$12\,000$</code> <span class="hint">(локално, без жетони)</span></span></label>
+        <div class="hint">Членуването, бройната форма и естественият изказ са част от инструкциите към модела и са винаги включени за български.</div>
+      </div>
+    </details>
+
+    <details>
+      <summary>Допълнителни проверки <span class="opt">(по-скъпи заявки)</span></summary>
+      <div class="inner">
+        <label class="check"><input type="checkbox" id="flagPhrases" /> <span>🟡 Подчертавай рискови фрази (калки, чуждици, тежки изрази) с алтернативи <span class="cost">+100–200 изходни жетона на стринг</span></span></label>
+        <div>
+          <label>↩️ Обратен превод за проверка на смисъла</label>
+          <select id="backTranslate">
+            <option value="off">Изключен</option>
+            <option value="single">Само при „Преведи този“</option>
+            <option value="all">При всеки превод (и „Преведи всички“)</option>
+          </select>
+          <div class="hint"><span class="cost" style="color:#b45309;font-weight:600">+1 заявка на стринг</span> — удвоява броя на заявките.</div>
+        </div>
+        <label class="check"><input type="checkbox" id="reviewTranslatedBtn" /> <span>🔍 Покажи бутон „Провери преведените“ за проверка на вече преведени стрингове <span class="cost">1 заявка на стринг</span></span></label>
+        <div class="hint">Бутонът „🔍 Провери“ в панела „Преведи този“ работи винаги — по 1 заявка, само когато го натиснеш.</div>
+      </div>
+    </details>
+
+    <details>
+      <summary>Памет и кеширане</summary>
+      <div class="inner">
+        <label class="check"><input type="checkbox" id="useCorrections" /> <span>🧠 Използвай запомнените поправки в заявките <span class="hint">(до 25 кратки двойки, ~200–500 жетона)</span></span></label>
+        <label class="check"><input type="checkbox" id="promptCaching" /> <span>⚡ Кеширане на промпта — по-евтини заявки при дълги речници</span></label>
+        <div>
+          <label>Обща памет на екипа (URL) <span class="opt">(по избор)</span></label>
+          <input type="text" id="teamMemoryUrl" placeholder="https://script.google.com/macros/s/…/exec" />
+          <div class="hint">Google Apps Script към обща таблица — виж README, раздел „Обща памет на екипа“.</div>
         </div>
         <div>
-          <label>Math Glossary URL <span class="opt">(optional)</span></label>
-          <input type="text" id="glossaryUrlMath" placeholder="https://… (math exercises)" />
+          <div class="section-title">Запомнени поправки (<span id="corrCount">0</span>)</div>
+          <div class="corr-list" id="corrList"></div>
+          <div class="hint">⭐ = поправена поне 3 пъти — кандидат за речника.</div>
+          <div class="mini-row" style="margin-top:6px">
+            <button class="mini-btn" id="corrCsv">⬇️ CSV</button>
+            <button class="mini-btn" id="corrClear">🗑 Изчисти</button>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details>
+      <summary>Статистика за качеството</summary>
+      <div class="inner">
+        <div class="stats" id="statsBox"></div>
+        <div class="mini-row"><button class="mini-btn" id="statsReset">↺ Нулирай</button></div>
+      </div>
+    </details>
+
+    <details>
+      <summary>Разширени</summary>
+      <div class="inner">
+        <div>
+          <label>Друг модел <span class="opt">(по избор)</span></label>
+          <input type="text" id="aiModel" placeholder="празно = модел по подразбиране" />
+          <div class="hint">напр. gemini-2.5-pro, gpt-4o, claude-sonnet-4-5</div>
         </div>
         <div>
-          <label>Science Glossary URL <span class="opt">(optional)</span></label>
-          <input type="text" id="glossaryUrlScience" placeholder="https://… (science exercises)" />
+          <label>Речник по математика (URL) <span class="opt">(по избор)</span></label>
+          <input type="text" id="glossaryUrlMath" placeholder="https://… (математика)" />
+        </div>
+        <div>
+          <label>Речник по природни науки (URL) <span class="opt">(по избор)</span></label>
+          <input type="text" id="glossaryUrlScience" placeholder="https://… (природни науки)" />
           <div class="hint">
-            Subject-aware: the extension reads the page URL to pick the matching glossary.
-            If a subject URL is blank, the main Glossary URL above is used.
+            Разширението разпознава предмета от адреса на страницата и избира съответния речник.
+            Ако полето е празно, се ползва основният речник.
           </div>
         </div>
       </div>
     </details>
     <div id="statusMsg" class="status"></div>
     <div class="row">
-      <button class="test-btn" id="testBtn">🧪 Test</button>
-      <button class="save-btn" id="saveBtn">Save Settings</button>
+      <button class="test-btn" id="testBtn">🧪 Тест</button>
+      <button class="save-btn" id="saveBtn">Запази настройките</button>
     </div>
   </div>
-  <div class="footer">Khan Academy · Localization · v5.0</div>
+  <div class="footer">Khan Academy · Локализация · <span id="versionName">BG</span></div>
+  <script src="bg.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

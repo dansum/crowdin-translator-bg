@@ -28,19 +28,19 @@ const PROVIDERS = {
     label: 'Google Gemini',
     defaultModel: 'gemini-2.5-flash',
     keyUrl: 'https://aistudio.google.com/apikey',
-    keyHint: 'Free tier available (rate-limited). Paid tier recommended for teams.',
+    keyHint: 'Има безплатно ниво (с ограничения). За екипи се препоръчва платено.',
   },
   openai: {
     label: 'OpenAI',
     defaultModel: 'gpt-4o-mini',
     keyUrl: 'https://platform.openai.com/api-keys',
-    keyHint: 'Requires a funded OpenAI platform account.',
+    keyHint: 'Изисква акаунт в OpenAI Platform с наличност.',
   },
   anthropic: {
     label: 'Anthropic Claude',
     defaultModel: 'claude-haiku-4-5-20251001',
     keyUrl: 'https://console.anthropic.com/settings/keys',
-    keyHint: 'Requires an Anthropic Console account with credits.',
+    keyHint: 'Изисква акаунт в Anthropic Console с кредити.',
   },
 };
 
@@ -68,14 +68,14 @@ for (const [code, name] of sorted) {
   opt.textContent = name;
   languageSelect.appendChild(opt);
 }
-languageSelect.value = 'hi'; // default
+languageSelect.value = 'bg'; // default
 
 function refreshProviderUI() {
   const p = PROVIDERS[providerSelect.value];
   providerHint.innerHTML =
-    `Get a key: <a href="${p.keyUrl}" target="_blank">${p.keyUrl.replace('https://','')}</a><br>${p.keyHint}`;
+    `Вземи ключ: <a href="${p.keyUrl}" target="_blank">${p.keyUrl.replace('https://','')}</a><br>${p.keyHint}`;
   apiKeyInput.value = apiKeys[providerSelect.value] || '';
-  aiModelInput.placeholder = `blank = ${p.defaultModel}`;
+  aiModelInput.placeholder = `празно = ${p.defaultModel}`;
 }
 
 providerSelect.addEventListener('change', refreshProviderUI);
@@ -101,6 +101,97 @@ chrome.storage.sync.get(
   }
 );
 
+// ── Bulgarian team settings (defaults live in bg.js) ─────────────────────────
+const BG_FIELDS = Object.keys(BG_DEFAULTS);
+function bgFieldValue(el) { return el.type === 'checkbox' ? el.checked : el.value.trim(); }
+chrome.storage.sync.get(BG_FIELDS, (r) => {
+  for (const k of BG_FIELDS) {
+    const el = document.getElementById(k);
+    if (!el) continue;
+    const v = r[k] === undefined ? BG_DEFAULTS[k] : r[k];
+    if (el.type === 'checkbox') el.checked = !!v; else el.value = v;
+  }
+});
+document.getElementById('versionName').textContent =
+  chrome.runtime.getManifest().version_name || chrome.runtime.getManifest().version;
+
+// ── Corrections memory ────────────────────────────────────────────────────────
+function renderCorrections() {
+  chrome.storage.local.get(['bgCorrections'], ({ bgCorrections = {} }) => {
+    const items = Object.entries(bgCorrections).sort((a, b) => b[1].count - a[1].count || b[1].last - a[1].last);
+    document.getElementById('corrCount').textContent = items.length;
+    const list = document.getElementById('corrList');
+    list.innerHTML = items.length ? '' : '<div class="hint" style="padding:6px 8px">Още няма. Поправките се запомнят, когато редактираш превода в „Преведи този“ преди „Вмъкни и запиши“.</div>';
+    for (const [key, c] of items) {
+      const row = document.createElement('div');
+      row.className = 'corr-item';
+      const text = document.createElement('span');
+      text.textContent = `${c.from} → ${c.to}`;
+      text.title = c.example || '';
+      const meta = document.createElement('span');
+      meta.innerHTML = `${c.count >= 3 ? '<span class="star">⭐</span> ' : ''}×${c.count}`;
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.title = 'Изтрий';
+      del.onclick = () => {
+        delete bgCorrections[key];
+        chrome.storage.local.set({ bgCorrections }, renderCorrections);
+      };
+      const right = document.createElement('span');
+      right.append(meta, del);
+      row.append(text, right);
+      list.appendChild(row);
+    }
+  });
+}
+renderCorrections();
+
+function downloadText(text, filename) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+document.getElementById('corrCsv').onclick = () => {
+  chrome.storage.local.get(['bgCorrections'], ({ bgCorrections = {} }) => {
+    const rows = [['Грешно', 'Предпочитано', 'Брой', 'Последно', 'Пример (оригинал)']];
+    for (const c of Object.values(bgCorrections)) {
+      rows.push([c.from, c.to, c.count, c.last ? new Date(c.last).toISOString().slice(0, 10) : '', c.example || '']);
+    }
+    downloadText(bgCsv(rows), 'zapomneni-popravki.csv');
+  });
+};
+document.getElementById('corrClear').onclick = () => {
+  if (confirm('Да изтрия ли всички запомнени поправки на този компютър?')) {
+    chrome.storage.local.set({ bgCorrections: {} }, renderCorrections);
+  }
+};
+
+// ── Quality statistics ────────────────────────────────────────────────────────
+function pct(a, b) { return b ? ` (${Math.round(100 * a / b)}%)` : ''; }
+function renderStats() {
+  chrome.storage.local.get(['bgStats'], ({ bgStats }) => {
+    const s = { flagsShown: 0, flagsAccepted: 0, flagsEditedByHand: 0, flagsIgnored: 0,
+                stringsTranslated: 0, backChecks: 0, backMismatches: 0, editedBeforeSave: 0, byReason: {}, ...(bgStats || {}) };
+    const decided = s.flagsAccepted + s.flagsEditedByHand + s.flagsIgnored;
+    const reasons = Object.entries(s.byReason || {}).sort((a, b) => b[1] - a[1])
+      .map(([r, n]) => `${bgReasonLabel(r)}: ${n}`).join(' · ');
+    document.getElementById('statsBox').innerHTML = `
+      Преведени стрингове: <b>${s.stringsTranslated}</b><br>
+      Показани рискови фрази: <b>${s.flagsShown}</b><br>
+      — приета алтернатива с един клик: <b>${s.flagsAccepted}</b>${pct(s.flagsAccepted, decided)}<br>
+      — поправени на ръка: <b>${s.flagsEditedByHand}</b>${pct(s.flagsEditedByHand, decided)}<br>
+      — оставени без промяна: <b>${s.flagsIgnored}</b>${pct(s.flagsIgnored, decided)}<br>
+      Обратни преводи: <b>${s.backChecks}</b>, с разминаване: <b>${s.backMismatches}</b>${pct(s.backMismatches, s.backChecks)}<br>
+      Редактирани преди запис („Преведи този“): <b>${s.editedBeforeSave}</b>
+      ${reasons ? `<div class="hint">По вид: ${reasons}</div>` : ''}`;
+  });
+}
+renderStats();
+document.getElementById('statsReset').onclick = () => {
+  if (confirm('Да нулирам ли статистиката?')) chrome.storage.local.set({ bgStats: {} }, renderStats);
+};
+
 function showStatus(msg, type, persist) {
   statusMsg.textContent = msg;
   statusMsg.className = 'status ' + type;
@@ -118,8 +209,12 @@ saveBtn.addEventListener('click', () => {
     glossaryUrlMath:    glossaryMathInput.value.trim(),
     glossaryUrlScience: glossarySciInput.value.trim(),
   };
+  for (const k of BG_FIELDS) {
+    const el = document.getElementById(k);
+    if (el) settings[k] = bgFieldValue(el);
+  }
   chrome.storage.sync.set(settings, () => {
-    showStatus('✅ Settings saved!', 'success');
+    showStatus('✅ Настройките са запазени!', 'success');
   });
 });
 
@@ -194,7 +289,7 @@ testBtn.addEventListener('click', async () => {
   const provider = providerSelect.value;
   const key = apiKeyInput.value.trim();
   if (!key) {
-    showStatus(`Enter your ${PROVIDERS[provider].label} API key first.`, 'error');
+    showStatus(`Първо въведи API ключ за ${PROVIDERS[provider].label}.`, 'error');
     return;
   }
   const lang     = languageSelect.value;
@@ -204,18 +299,18 @@ testBtn.addEventListener('click', async () => {
 
   testBtn.disabled = true;
   testBtn.textContent = '⏳…';
-  showStatus(`Testing ${PROVIDERS[provider].label} (${model}) with ${langName}…`, 'info', true);
+  showStatus(`Тествам ${PROVIDERS[provider].label} (${model}) с език ${langName}…`, 'info', true);
 
   try {
     let result;
     if (provider === 'openai')         result = await testOpenAI(key, model, sysPrompt);
     else if (provider === 'anthropic') result = await testAnthropic(key, model, sysPrompt);
     else                               result = await testGemini(key, model, sysPrompt);
-    showStatus(`✅ Working! "${result || '(empty response)'}"`, 'success', true);
+    showStatus(`✅ Работи! „${result || '(празен отговор)'}“`, 'success', true);
   } catch (e) {
     showStatus(`❌ ${e.message}`, 'error', true);
   } finally {
     testBtn.disabled = false;
-    testBtn.textContent = '🧪 Test';
+    testBtn.textContent = '🧪 Тест';
   }
 });

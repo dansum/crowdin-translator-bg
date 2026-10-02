@@ -32,7 +32,7 @@ const WORLD_LANGUAGES = {
 };
 const LANGUAGES = WORLD_LANGUAGES; // backward-compat alias
 
-let selectedLanguage = 'hi';
+let selectedLanguage = 'bg';
 // ── AI provider configuration ─────────────────────────────────────────────────
 // Users pick a provider in the popup and store one API key per provider.
 // Adding a provider = add an entry here + a case in callProvider() + host_permissions.
@@ -222,7 +222,7 @@ async function translateLine(text, lang, depth = 0) {
     return (tLeft + sep + tRight).trim();
   }
 
-  const restored = restore(translated, map);
+  const restored = restore(bgPostTokenized(translated, lang), bgLocalizeMap(map, lang));
   return fixWidgetCounts(restored, text);
 }
 
@@ -230,8 +230,13 @@ async function translateLine(text, lang, depth = 0) {
 // This keeps each Google Translate call small (fewer PUA tokens per call),
 // preventing Google from dropping tokens — the main failure mode on complex strings.
 // Pure-structure lines (e.g. "-| :-: | :-:") are kept as-is without a network call.
-async function translateText(text, lang) {
-  if (!text || !text.trim()) return text;
+//
+// Returns { text, flags, back, engine }:
+//   flags — risky phrases marked by the model (only when the "flagPhrases" setting is on)
+//   back  — { back, match, issue } back-translation check (only when "backTranslate" is on)
+// opts.single = true when called from the Translate This panel.
+async function translateTextDetailed(text, lang, opts = {}) {
+  if (!text || !text.trim()) return { text, flags: [], back: null, engine: 'none' };
 
   // Pre-protect $\begin{env}...\end{env}$ blocks before any further processing.
   const mlMap = [];
@@ -243,10 +248,11 @@ async function translateText(text, lang) {
       return String.fromCodePoint(cp);
     }
   );
+  const mlOriginal = o => (isBg(lang) && bgSettings.bgMathLocale) ? bgLocalizeMath(o) : o;
   const restoreML = s => {
     let r = s;
     for (const { cp, original } of mlMap)
-      r = r.replace(new RegExp(`\\u{${cp.toString(16)}}`, 'gu'), original);
+      r = r.replace(new RegExp(`\\u{${cp.toString(16)}}`, 'gu'), mlOriginal(original));
     return r;
   };
 
@@ -254,10 +260,24 @@ async function translateText(text, lang) {
   if (activeApiKey()) {
     try {
       const { tokenized, map } = tokenizeForGemini(preText);
-      const translated = await translateWithAI(tokenized, lang);
-      const dropped = map.length - countPUA(translated);
+      const raw = await translateWithAI(tokenized, lang);
+      const split = bgSplitNotes(raw);
+      const body = bgPostTokenized(stripSourceTags(split.text), lang);
+      const dropped = map.length - countPUA(body);
       if (dropped > 0) throw new Error(`${providerLabel()} dropped ${dropped} placeholder token(s)`);
-      return fixWidgetCounts(restoreML(restore(translated, map)), text);
+      const lmap = bgLocalizeMap(map, lang);
+      const finalText = fixWidgetCounts(restoreML(restore(body, lmap)), text);
+      const flags = split.flags
+        .map(f => ({ ...f, phrase: restoreML(restore(bgPostTokenized(f.phrase, lang), lmap)) }))
+        .filter(f => finalText.includes(f.phrase));
+
+      let back = null;
+      const mode = bgSettings.backTranslate;
+      if (mode === 'all' || (mode === 'single' && opts.single)) {
+        try { back = await backTranslateCheck(tokenized, body, lang, map); }
+        catch (e) { console.warn('[KAT] Back-translation failed:', e.message); }
+      }
+      return { text: finalText, flags, back, engine: 'ai' };
     } catch (e) {
       console.warn(`[KAT] ${providerLabel()} failed, falling back to Google Translate:`, e.message);
     }
@@ -265,7 +285,7 @@ async function translateText(text, lang) {
 
   // ── Google Translate path — line-by-line to minimise token drops ───────────
   if (!preText.includes('\n')) {
-    return restoreML(await translateLine(preText, lang));
+    return { text: restoreML(await translateLine(preText, lang)), flags: [], back: null, engine: 'google' };
   }
 
   const lines = preText.split('\n');
@@ -283,13 +303,28 @@ async function translateText(text, lang) {
       results.push(await translateLine(line, lang));
     }
   }
-  return restoreML(results.join('\n'));
+  return { text: restoreML(results.join('\n')), flags: [], back: null, engine: 'google' };
 }
-// ── AI translation engine (multi-provider) ───────────────────────────────────
-// Builds one shared system prompt (rules + glossary + translation memory), then
-// dispatches to the configured provider. Each provider caller returns plain text.
 
-async function buildSystemPrompt(lang) {
+async function translateText(text, lang) {
+  return (await translateTextDetailed(text, lang)).text;
+}
+
+// Models occasionally echo the <source> wrapper used when caching is on.
+function stripSourceTags(s) {
+  return s.replace(/^\s*<source>\s*/i, '').replace(/\s*<\/source>\s*$/i, '');
+}
+
+// ── AI translation engine (multi-provider) ───────────────────────────────────
+// Builds one shared system prompt (rules + glossary + learned corrections), then
+// dispatches to the configured provider. Each provider caller returns plain text.
+//
+// Prompt caching: with the "promptCaching" setting on, the system prompt holds only
+// content that stays the same for a whole batch; the per-string translation memory
+// travels in the user message instead. That lets Anthropic (explicit cache_control),
+// OpenAI and Gemini (automatic prefix caching) reuse the system prompt.
+
+async function buildSystemPrompt(lang, { review = false } = {}) {
   const langName = WORLD_LANGUAGES[lang] || lang;
   let sysPrompt =
     `You are a professional translator for Khan Academy educational content. ` +
@@ -309,7 +344,12 @@ async function buildSystemPrompt(lang) {
     `4. Use clear, student-friendly language for school-age learners (grades 3-12).
 ` +
     `5. Return ONLY the translated text — no explanation, no quotes, no commentary.
-` +
+`;
+
+  if (isBg(lang)) {
+    sysPrompt += bgRules();
+  } else {
+    sysPrompt +=
     `6. TERMINOLOGY: Prefer the proper scientific/technical ${langName} term over a colloquial word or English transliteration. ` +
     `For example, in Marathi prefer जठर over पोट (stomach), पेशी over "cell", मूत्रपिंड over किडनी (kidney), ऊती over "tissue", तंत्र/संस्था over "system" — and stay consistent within a string.
 ` +
@@ -328,6 +368,7 @@ async function buildSystemPrompt(lang) {
 ` +
     `11. ANSWER-MATCHES-QUESTION: For True/False or matching exercises, if an answer-choice statement repeats wording from the question, ` +
     `use the IDENTICAL target-language wording from the question — do not re-translate the same phrase differently.`;
+  }
 
   const glossary = await getGlossary();
   if (glossary) {
@@ -337,17 +378,47 @@ Glossary (prefer these translations for listed terms):
 ${glossary}`;
   }
 
-  // Recent in-batch translations — the strongest consistency signal the model
-  // gets. Without it, terms like "voyager" or "kidney" can vary per string.
-  if (_translationMemory.length > 0) {
-    const tmText = _translationMemory.map(p => `${p.src} → ${p.tgt}`).join('\n');
+  // Corrections translators made to earlier AI output (local + team memory).
+  const corrections = await bgCorrectionsForPrompt();
+  if (corrections.length > 0) {
     sysPrompt += `
 
-Recent translations from this same exercise — be consistent with these (use the same wording for the same terms):
-${tmText}`;
+Preferences learned from translators' corrections of earlier AI output (wrong → preferred). ` +
+      `When the same wording would appear, use the preferred form — but only where it fits the context:
+${corrections.map(c => `- ${c.from} → ${c.to}`).join('\n')}`;
+  }
+
+  if (review) return sysPrompt;
+
+  if (bgSettings.flagPhrases && isBg(lang)) sysPrompt += bgNotesInstruction();
+
+  // Without caching, keep the original layout: translation memory in the system prompt.
+  if (!bgSettings.promptCaching && _translationMemory.length > 0) {
+    sysPrompt += `
+
+${tmBlock()}`;
   }
 
   return sysPrompt;
+}
+
+// Recent in-batch translations — the strongest consistency signal the model
+// gets. Without it, terms like "voyager" or "kidney" can vary per string.
+function tmBlock() {
+  const tmText = _translationMemory.map(p => `${p.src} → ${p.tgt}`).join('\n');
+  return `Recent translations from this same exercise — be consistent with these (use the same wording for the same terms):
+${tmText}`;
+}
+
+function buildUserMessage(tokenized, lang) {
+  if (!bgSettings.promptCaching || _translationMemory.length === 0) return tokenized;
+  const notes = bgSettings.flagPhrases && isBg(lang) ? ' (then the notes block described above)' : '';
+  return `${tmBlock()}
+
+Translate the text between <source> and </source>. Output only the translation${notes}, without the tags.
+<source>
+${tokenized}
+</source>`;
 }
 
 // One fetch per provider. Each returns the raw translated text or throws.
@@ -397,6 +468,11 @@ async function callOpenAI(sysPrompt, text, model) {
 }
 
 async function callAnthropic(sysPrompt, text, model) {
+  // With caching on, mark the (stable) system prompt as a cache breakpoint.
+  // Prompts shorter than the model's minimum (4096 tokens on Haiku 4.5) are simply not cached.
+  const system = bgSettings.promptCaching
+    ? [{ type: 'text', text: sysPrompt, cache_control: { type: 'ephemeral' } }]
+    : sysPrompt;
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -410,12 +486,13 @@ async function callAnthropic(sysPrompt, text, model) {
       model,
       max_tokens: 4096,
       temperature: 0.1,
-      system: sysPrompt,
+      system,
       messages: [{ role: 'user', content: text }],
     }),
   });
   if (!res.ok) return { retryable: res.status === 429 || res.status === 529 || res.status >= 500, error: `Anthropic API ${res.status}: ${(await res.text()).slice(0, 200)}`, status: res.status };
   const data = await res.json();
+  if (data.usage?.cache_read_input_tokens) console.log(`[KAT] Anthropic cache hit: ${data.usage.cache_read_input_tokens} tokens`);
   const result = data.content?.[0]?.text;
   if (!result) return { error: 'Anthropic returned empty response' };
   return { text: result.trim() };
@@ -430,8 +507,8 @@ async function callProvider(sysPrompt, text, model) {
   }
 }
 
-async function translateWithAI(tokenized, lang) {
-  const sysPrompt = await buildSystemPrompt(lang);
+// Rate-limited provider call with one retry on transient errors.
+async function aiRequest(sysPrompt, userText) {
   const model = activeModel();
 
   // Rate-limit gap. Gemini's free tier is 15 RPM; other providers get a small
@@ -441,7 +518,7 @@ async function translateWithAI(tokenized, lang) {
   if (gap < minGap) await sleep(minGap - gap);
   _lastAICallTime = Date.now();
 
-  let result = await callProvider(sysPrompt, tokenized, model);
+  let result = await callProvider(sysPrompt, userText, model);
 
   // Retry once on transient errors (rate limit / server overload).
   if (result.error && result.retryable) {
@@ -449,11 +526,82 @@ async function translateWithAI(tokenized, lang) {
     console.warn(`[KAT] ${providerLabel()} ${result.status}, retrying after ${waitMs}ms…`);
     await sleep(waitMs);
     _lastAICallTime = Date.now();
-    result = await callProvider(sysPrompt, tokenized, model);
+    result = await callProvider(sysPrompt, userText, model);
   }
 
   if (result.error) throw new Error(result.error);
   return result.text;
+}
+
+async function translateWithAI(tokenized, lang) {
+  const sysPrompt = await buildSystemPrompt(lang);
+  return aiRequest(sysPrompt, buildUserMessage(tokenized, lang));
+}
+
+// ── Back-translation check (optional, one extra call) ─────────────────────────
+// Translates the result back to English and asks whether the meaning still matches.
+async function backTranslateCheck(srcTokenized, tgtTokenized, lang, map) {
+  const langName = WORLD_LANGUAGES[lang] || lang;
+  const issueLang = isBg(lang) ? 'Bulgarian' : 'English';
+  const sys =
+    `You verify translations of Khan Academy exercises from English into ${langName}. ` +
+    `Characters U+E000–U+F8FF are placeholders for math and widgets — copy them unchanged.
+` +
+    `1) Translate the ${langName} text back into English as literally as possible.
+` +
+    `2) Compare its meaning with the original English. Small wording or style differences still match. ` +
+    `Changed numbers, a lost or added negation, swapped quantities (at least / at most, more / less), ` +
+    `a different actor, or missing or extra information do NOT match.
+` +
+    `Answer ONLY with JSON: {"back": "<literal English back-translation>", "match": true or false, ` +
+    `"issue": "<if match is false: a short explanation in ${issueLang}; otherwise empty>"}`;
+  const user = `Original English:
+${srcTokenized}
+
+${langName} translation:
+${tgtTokenized}`;
+  const out = bgExtractJson(await aiRequest(sys, user), '{', '}');
+  if (!out || typeof out.back !== 'string') return null;
+  const result = {
+    back: map ? restore(out.back, map) : out.back,
+    match: out.match !== false,
+    issue: String(out.issue || ''),
+  };
+  bgStat(s => { s.backChecks++; if (!result.match) s.backMismatches++; });
+  return result;
+}
+
+// ── Review an existing translation (Translate This "Check" + batch check) ─────
+// One call: risky phrases + back-translation of a translation that already exists.
+async function reviewExistingTranslation(source, translation, lang) {
+  const langName = WORLD_LANGUAGES[lang] || lang;
+  const sys = await buildSystemPrompt(lang, { review: true });
+  const user =
+    `REVIEW MODE — do not translate anything. Review the existing ${langName} translation below ` +
+    `against its English source, using the rules above. Math, widgets and markup must stay unchanged and are not a problem.
+` +
+    `Answer ONLY with JSON: {"flags": [up to 5 items {"phrase": "<exact substring of the translation>", ` +
+    `"reason": "calque" | "anglicism" | "awkward" | "terminology" | "ambiguous" | "grammar", ` +
+    `"note": "<short explanation in ${isBg(lang) ? 'Bulgarian' : 'English'}>", "alternatives": ["<1 to 3 replacements>"]}], ` +
+    `"back": "<literal English back-translation>", "match": true or false, ` +
+    `"issue": "<if the meaning differs from the source: short explanation; otherwise empty>"}
+
+English source:
+${source}
+
+${langName} translation:
+${translation}`;
+  const out = bgExtractJson(await aiRequest(sys, user), '{', '}');
+  if (!out) throw new Error('Could not read the review result');
+  const flags = bgCleanFlags(out.flags).filter(f => translation.includes(f.phrase));
+  const back = typeof out.back === 'string'
+    ? { back: out.back, match: out.match !== false, issue: String(out.issue || '') }
+    : null;
+  bgStat(s => {
+    s.flagsShown += flags.length;
+    if (back) { s.backChecks++; if (!back.match) s.backMismatches++; }
+  });
+  return { flags, back };
 }
 
 // Detects subject from the page URL or document content.
@@ -1076,11 +1224,23 @@ async function activateJiptElement(el) {
   }
 }
 
+// ── Review queue ──────────────────────────────────────────────────────────────
+// Strings a reviewer should look at after a batch: risky phrases or a meaning
+// mismatch in the back-translation. Filled by Translate All and by Check Translated.
+let _reviewQueue = [];
+function noteResult(source, r, el) {
+  bgStat(s => { s.stringsTranslated++; s.flagsShown += r.flags.length; });
+  if (r.flags.length || (r.back && !r.back.match)) {
+    _reviewQueue.push({ source, text: r.text, flags: r.flags, back: r.back, el });
+  }
+}
+
 // ── TRANSLATE ALL ─────────────────────────────────────────────────────────────
 async function translateAll() {
   chrome.storage.sync.get(SETTINGS_KEYS, async result => {
     applySettings(result);
     clearTM(); // start a fresh translation memory for each new batch
+    _reviewQueue = [];
     await runNavigationBatch();
   });
 }
@@ -1092,7 +1252,7 @@ async function runNavigationBatch() {
 
   overlay.querySelector('#ka-stop-btn').onclick = () => {
     stopped = true;
-    overlay.querySelector('#ka-stop-btn').textContent = 'Stopping…';
+    overlay.querySelector('#ka-stop-btn').textContent = 'Спиране…';
     overlay.remove();
   };
 
@@ -1103,15 +1263,15 @@ async function runNavigationBatch() {
     // Try to auto-open by clicking the first available JIPT element
     const { els: earlyEls } = getUntranslatedElements();
     if (earlyEls.length > 0) {
-      updateProgress(overlay, 0, 0, '⏳ Opening editor panel…');
+      updateProgress(overlay, 0, 0, '⏳ Отварям панела на редактора…');
       await activateJiptElement(earlyEls[0]);
       await sleep(1500);
     }
     // If still no iframe, ask the user
     if (!findCrowdinIframe()) {
-      updateProgress(overlay, 0, 0, '👆 Click any string to open the editor');
+      updateProgress(overlay, 0, 0, '👆 Щракни върху стринг, за да се отвори редакторът');
       overlay.querySelector('#ka-prog-current').textContent =
-        'Click a string in the page to open the translation panel, then try again.';
+        'Щракни върху стринг на страницата, за да се отвори панелът за превод, и опитай пак.';
       const appeared = await new Promise(r => {
         const obs = new MutationObserver(() => {
           if (findCrowdinIframe()) { obs.disconnect(); r(true); }
@@ -1121,24 +1281,24 @@ async function runNavigationBatch() {
       });
       if (!appeared || stopped) {
         const s = overlay.querySelector('#ka-stop-btn');
-        s.textContent = '✕ Close'; s.onclick = () => overlay.remove();
+        s.textContent = '✕ Затвори'; s.onclick = () => overlay.remove();
         return;
       }
     }
   }
 
   // ── Step 2: Connect to iframe content script ──
-  updateProgress(overlay, 0, 0, '⏳ Connecting to Crowdin editor…');
+  updateProgress(overlay, 0, 0, '⏳ Свързване с редактора на Crowdin…');
   const ready = await waitForIframe(12000);
   if (!ready) {
-    updateProgress(overlay, 0, 0, '❌ Editor not responding — try reloading the page');
+    updateProgress(overlay, 0, 0, '❌ Редакторът не отговаря — презареди страницата');
     const s = overlay.querySelector('#ka-stop-btn');
-    s.textContent = '✕ Close'; s.onclick = () => overlay.remove();
+    s.textContent = '✕ Затвори'; s.onclick = () => overlay.remove();
     return;
   }
 
   // ── Step 3: Find untranslated JIPT elements ──
-  updateProgress(overlay, 0, 0, '🔍 Scanning for untranslated strings…');
+  updateProgress(overlay, 0, 0, '🔍 Търся непреведени стрингове…');
   await sleep(400);
 
   const { els: jiptElements, mode } = getUntranslatedElements();
@@ -1146,14 +1306,14 @@ async function runNavigationBatch() {
 
   if (jiptElements.length === 0) {
     // No JIPT elements found — fall back to the old iframe-navigation approach
-    updateProgress(overlay, 0, 0, '⚠️ No inline strings found — using editor navigation…');
+    updateProgress(overlay, 0, 0, '⚠️ Няма стрингове на страницата — минавам през редактора…');
     await sleep(500);
     await runIframeFallback(overlay, MAX, () => stopped);
     return;
   }
 
   const total = jiptElements.length;
-  updateProgress(overlay, 0, total, `✅ Found ${total} untranslated strings. Starting…`);
+  updateProgress(overlay, 0, total, `✅ Намерени непреведени стрингове: ${total}. Започвам…`);
   await sleep(600);
 
   // Track the source of the last successfully saved string.
@@ -1171,7 +1331,7 @@ async function runNavigationBatch() {
     const attrSource = getJiptSourceAttr(el);
 
     // Click to activate this string in the Crowdin editor panel
-    updateProgress(overlay, done, total, `String ${i+1}/${total} — activating…`, attrSource ? `"${attrSource.slice(0,50)}"` : '');
+    updateProgress(overlay, done, total, `Стринг ${i+1}/${total} — отварям…`, attrSource ? `"${attrSource.slice(0,50)}"` : '');
     await activateJiptElement(el);
 
     // Wait for the Crowdin iframe to render: need BOTH hasInput AND source text.
@@ -1219,12 +1379,14 @@ async function runNavigationBatch() {
         const source = attrSource || findTopFrameSource();
         if (source && isTranslatableSource(source)) {
           try {
-            const translation = await translateText(source, selectedLanguage);
+            const r = await translateTextDetailed(source, selectedLanguage);
+            const translation = r.text;
             await insertInTopFrame(topInput, translation);
             done++;
             prevSavedSource = source;
             pushToTM(source, translation);
-            updateProgress(overlay, done, total, `${done} saved ✓`, `"${source.slice(0,50)}"`);
+            noteResult(source, r, el);
+            updateProgress(overlay, done, total, `Записани: ${done} ✓`, `"${source.slice(0,50)}"`);
           } catch(e) {
             errors++;
             console.warn('[KAT]', e.message);
@@ -1237,7 +1399,7 @@ async function runNavigationBatch() {
 
       // If nothing works, skip this element
       skipped++;
-      updateProgress(overlay, done, total, `Skipping (no input found, ${diagMsg})`, attrSource?.slice(0,40) || '');
+      updateProgress(overlay, done, total, `Пропуснат (няма поле за превод, ${diagMsg})`, attrSource?.slice(0,40) || '');
       continue;
     }
 
@@ -1251,7 +1413,7 @@ async function runNavigationBatch() {
     const hasRealTranslation = existing.length > 0 && /[^\x00-\x7F]/.test(existing);
     if (hasRealTranslation) {
       skipped++;
-      updateProgress(overlay, done, total, `Skipping (already translated)`, source ? `"${source.slice(0,50)}"` : '');
+      updateProgress(overlay, done, total, `Пропуснат (вече е преведен)`, source ? `"${source.slice(0,50)}"` : '');
       continue;
     }
 
@@ -1260,31 +1422,33 @@ async function runNavigationBatch() {
     if (source && /[ऀ-ॿ]/.test(source)) {
       skipped++;
       console.warn('[KAT] Rejected source with Devanagari (likely UI text):', source.slice(0,60));
-      updateProgress(overlay, done, total, `Skipping (UI text detected)`, `"${source.slice(0,50)}"`);
+      updateProgress(overlay, done, total, `Пропуснат (текст от интерфейса)`, `"${source.slice(0,50)}"`);
       continue;
     }
 
     if (!source || !isTranslatableSource(source)) {
       skipped++;
-      updateProgress(overlay, done, total, `Skipping (not translatable)`, source ? `"${source.slice(0,50)}"` : '(no source)');
+      updateProgress(overlay, done, total, `Пропуснат (не подлежи на превод)`, source ? `"${source.slice(0,50)}"` : '(няма оригинал)');
       continue;
     }
 
     // Translate and insert
-    updateProgress(overlay, done, total, 'Translating…', `"${source.slice(0,55)}"`);
+    updateProgress(overlay, done, total, 'Превеждам…', `"${source.slice(0,55)}"`);
     try {
-      const translation = await translateText(source, selectedLanguage);
+      const r = await translateTextDetailed(source, selectedLanguage);
+      const translation = r.text;
       const result = await iframeCmd('INSERT_SAVE', { text: translation }, 8000);
       if (result?.ok) {
         done++;
         prevSavedSource = source;
         pushToTM(source, translation);
-        updateProgress(overlay, done, total, `${done} saved ✓`, `"${source.slice(0,55)}"`);
+        noteResult(source, r, el);
+        updateProgress(overlay, done, total, `Записани: ${done} ✓`, `"${source.slice(0,55)}"`);
       } else {
         errors++;
         const errDetail = result?.error || 'save failed';
         console.warn('[KAT] INSERT_SAVE failed:', errDetail, 'for source:', source.slice(0,50));
-        updateProgress(overlay, done, total, `${done} saved (${errors} failed)`, errDetail);
+        updateProgress(overlay, done, total, `Записани: ${done} (грешки: ${errors})`, errDetail);
       }
     } catch(e) {
       errors++;
@@ -1300,6 +1464,9 @@ async function runNavigationBatch() {
 // ── Top-frame input/source detection ─────────────────────────────────────────
 // For the case where the Crowdin panel is rendered in the top frame
 
+// The extension's own panels contain textareas — never treat them as Crowdin's input.
+const KAT_UI = '#ka-translator-overlay, #ka-single-panel, #ka-review-panel';
+
 function findTopFrameTranslationInput() {
   // Look for contenteditable or textarea that appeared after clicking a JIPT element.
   // Exclude the JIPT content elements themselves (they're the source display).
@@ -1307,14 +1474,14 @@ function findTopFrameTranslationInput() {
                         'crowdin_jipt_translated', 'crowdin_jipt'];
 
   for (const el of document.querySelectorAll('textarea')) {
-    if (el.closest('#ka-translator-overlay')) continue;
+    if (el.closest(KAT_UI)) continue;
     const rect = el.getBoundingClientRect();
     if (rect.width > 20 && rect.height > 10) return el;
   }
 
   for (const el of document.querySelectorAll('[contenteditable="true"]')) {
     if (el === document.body || el === document.documentElement) continue;
-    if (el.closest('#ka-translator-overlay')) continue;
+    if (el.closest(KAT_UI)) continue;
     // Skip JIPT content nodes
     if (JIPT_CLASSES.some(c => el.classList.contains(c))) continue;
     const rect = el.getBoundingClientRect();
@@ -1359,7 +1526,7 @@ async function insertInTopFrame(el, text) {
   // Try to save
   for (const sel of ['button[class*="save" i]','button[class*="approve" i]','button[type="submit"]']) {
     const btn = document.querySelector(sel);
-    if (btn && !btn.closest('#ka-translator-overlay')) { btn.click(); return; }
+    if (btn && !btn.closest(KAT_UI)) { btn.click(); return; }
   }
   el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', keyCode: 9, bubbles: true }));
 }
@@ -1379,7 +1546,7 @@ async function runIframeFallback(overlay, MAX, isStopped) {
       if (isStopped()) break;
       state = await iframeCmd('GET_STATE');
       if (state?.hasInput) break;
-      updateProgress(overlay, done, total, `⏳ Waiting for editor… (${attempt+1}/10)`,
+      updateProgress(overlay, done, total, `⏳ Чакам редактора… (${attempt+1}/10)`,
         state?.debug ? `CEs:${state.debug.allCE} TAs:${state.debug.allTA}` : '');
       await sleep(1000);
     }
@@ -1387,9 +1554,9 @@ async function runIframeFallback(overlay, MAX, isStopped) {
     if (isStopped()) break;
 
     if (!state?.hasInput) {
-      updateProgress(overlay, done, total, '❌ No input found. Select a string in the editor to start.');
+      updateProgress(overlay, done, total, '❌ Няма поле за превод. Избери стринг в редактора и опитай пак.');
       const s = overlay.querySelector('#ka-stop-btn');
-      s.textContent = '✕ Close'; s.onclick = () => overlay.remove();
+      s.textContent = '✕ Затвори'; s.onclick = () => overlay.remove();
       return;
     }
 
@@ -1400,20 +1567,22 @@ async function runIframeFallback(overlay, MAX, isStopped) {
 
     if (existing && existing.length > 0) {
       skipped++; total++; processedCount++;
-      updateProgress(overlay, done, total, 'Skipping (already translated)', source?.slice(0,50) || '');
+      updateProgress(overlay, done, total, 'Пропуснат (вече е преведен)', source?.slice(0,50) || '');
 
       // NEXT: try iframe's doNext OR look for untranslated JIPT element
       await iframeCmdNext();
     } else if (source && isTranslatableSource(source)) {
       total++; processedCount++;
-      updateProgress(overlay, done, total, 'Translating…', `"${source.slice(0,55)}"`);
+      updateProgress(overlay, done, total, 'Превеждам…', `"${source.slice(0,55)}"`);
       try {
-        const translation = await translateText(source, selectedLanguage);
+        const r = await translateTextDetailed(source, selectedLanguage);
+        const translation = r.text;
         const result = await iframeCmd('INSERT_SAVE', { text: translation });
         if (result?.ok) {
           done++;
           pushToTM(source, translation);
-          updateProgress(overlay, done, total, `${done} saved ✓`, `"${source.slice(0,55)}"`);
+          noteResult(source, r, null);
+          updateProgress(overlay, done, total, `Записани: ${done} ✓`, `"${source.slice(0,55)}"`);
         } else {
           errors++;
         }
@@ -1424,7 +1593,7 @@ async function runIframeFallback(overlay, MAX, isStopped) {
       await iframeCmdNext();
     } else {
       skipped++; total++; processedCount++;
-      updateProgress(overlay, done, total, 'Skipping', source?.slice(0,50) || '(no source)');
+      updateProgress(overlay, done, total, 'Пропуснат', source?.slice(0,50) || '(няма оригинал)');
       await iframeCmdNext();
     }
 
@@ -1455,7 +1624,7 @@ async function iframeCmdNext() {
 }
 
 // ── Progress overlay ──────────────────────────────────────────────────────────
-function showProgressOverlay() {
+function showProgressOverlay(title = '⚡ Превод на всички стрингове') {
   document.getElementById('ka-translator-overlay')?.remove();
   const overlay = document.createElement('div');
   overlay.id = 'ka-translator-overlay';
@@ -1469,14 +1638,14 @@ function showProgressOverlay() {
   });
   overlay.innerHTML = `
     <div style="background:linear-gradient(135deg,#059669,#0d9488);padding:14px 18px;color:#fff">
-      <div style="font-size:15px;font-weight:700">⚡ Translating All Strings</div>
+      <div style="font-size:15px;font-weight:700">${escapeHtml(title)}</div>
       <div style="font-size:11px;opacity:.85;margin-top:2px">${activeApiKey() ? providerLabel() + ' AI' : 'Google Translate'} · ${WORLD_LANGUAGES[selectedLanguage]||selectedLanguage}</div>
     </div>
     <div style="padding:16px;display:flex;flex-direction:column;gap:12px">
       <div>
         <div style="display:flex;justify-content:space-between;margin-bottom:5px;font-size:13px;color:#374151">
-          <span id="ka-prog-label">Starting…</span>
-          <span id="ka-prog-count" style="font-weight:600;color:#059669">0 saved</span>
+          <span id="ka-prog-label">Започвам…</span>
+          <span id="ka-prog-count" style="font-weight:600;color:#059669">0</span>
         </div>
         <div style="background:#f3f4f6;border-radius:99px;height:6px;overflow:hidden">
           <div id="ka-prog-bar" style="height:100%;width:5%;background:linear-gradient(90deg,#059669,#0d9488);border-radius:99px;transition:width .4s"></div>
@@ -1484,7 +1653,7 @@ function showProgressOverlay() {
       </div>
       <div id="ka-prog-current" style="font-size:12px;color:#6b7280;min-height:16px;word-break:break-word"></div>
       <div style="display:flex;justify-content:flex-end">
-        <button id="ka-stop-btn" style="padding:7px 14px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:1.5px solid #e5e7eb;background:#fff;color:#374151;font-family:inherit">⏹ Stop</button>
+        <button id="ka-stop-btn" style="padding:7px 14px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:1.5px solid #e5e7eb;background:#fff;color:#374151;font-family:inherit">⏹ Спри</button>
       </div>
       <div id="ka-summary" style="font-size:13px;border-radius:8px;padding:10px 14px;display:none"></div>
     </div>
@@ -1496,27 +1665,227 @@ function showProgressOverlay() {
 function updateProgress(overlay, done, total, label, current) {
   const pct = total > 0 ? Math.min(Math.round((done/total)*100), 100) : 10;
   overlay.querySelector('#ka-prog-bar').style.width = Math.max(pct, 5)+'%';
-  overlay.querySelector('#ka-prog-count').textContent = `${done} saved`;
+  overlay.querySelector('#ka-prog-count').textContent = total > 0 ? `${done} / ${total}` : `${done}`;
   overlay.querySelector('#ka-prog-label').textContent = label;
   if (current !== undefined) overlay.querySelector('#ka-prog-current').textContent = current;
 }
 
-function showSummary(overlay, done, total, errors, skipped) {
+function showSummary(overlay, done, total, errors, skipped, mode = 'translate') {
   const s = overlay.querySelector('#ka-summary');
   s.style.display = 'block';
   s.style.background = errors === 0 ? '#d1fae5' : '#fef3c7';
   s.style.color = errors === 0 ? '#065f46' : '#92400e';
-  s.innerHTML = `✅ <strong>${done}</strong> translated & saved`
-    + (skipped > 0 ? ` · ⏭ <strong>${skipped}</strong> skipped` : '')
-    + (errors > 0 ? ` · ⚠️ <strong>${errors}</strong> errors` : '');
+  s.innerHTML = (mode === 'check'
+      ? `🔍 Проверени: <strong>${done}</strong>`
+      : `✅ Преведени и записани: <strong>${done}</strong>`)
+    + (skipped > 0 ? ` · ⏭ пропуснати: <strong>${skipped}</strong>` : '')
+    + (errors > 0 ? ` · ⚠️ грешки: <strong>${errors}</strong>` : '');
+  if (_reviewQueue.length > 0) {
+    s.innerHTML += `
+      <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(0,0,0,.08);color:#92400e">
+        🟡 За преглед: <strong>${_reviewQueue.length}</strong> (рискови фрази или разминаване в смисъла)
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <button id="ka-queue-show" style="${SMALL_BTN}">📋 Покажи списъка</button>
+          <button id="ka-queue-csv" style="${SMALL_BTN}">⬇️ CSV</button>
+        </div>
+      </div>`;
+    s.querySelector('#ka-queue-show').onclick = showReviewPanel;
+    s.querySelector('#ka-queue-csv').onclick = downloadQueueCsv;
+  }
   const stop = overlay.querySelector('#ka-stop-btn');
-  stop.textContent = '✕ Close';
+  stop.textContent = '✕ Затвори';
   stop.onclick = () => overlay.remove();
+}
+
+const SMALL_BTN = 'padding:5px 10px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;border:1.5px solid #e5e7eb;background:#fff;color:#374151;font-family:inherit';
+
+// ── Highlighting risky phrases ────────────────────────────────────────────────
+// Returns HTML of `text` with each flagged phrase wrapped in <mark>. Overlaps are skipped.
+function highlightFlags(text, flags) {
+  const ranges = [];
+  flags.forEach((f, i) => {
+    const at = text.indexOf(f.phrase);
+    if (at !== -1) ranges.push({ a: at, b: at + f.phrase.length, i });
+  });
+  ranges.sort((x, y) => x.a - y.a);
+  let html = '', pos = 0;
+  for (const r of ranges) {
+    if (r.a < pos) continue;
+    const f = flags[r.i];
+    const tip = `${bgReasonLabel(f.reason)}: ${f.note}${f.alternatives.length ? ' → ' + f.alternatives.join(' / ') : ''}`;
+    html += escapeHtml(text.slice(pos, r.a))
+      + `<mark title="${escapeHtml(tip)}" style="background:#fde68a;border-bottom:2px solid #d97706;border-radius:3px;padding:0 2px">${escapeHtml(text.slice(r.a, r.b))}</mark>`;
+    pos = r.b;
+  }
+  return html + escapeHtml(text.slice(pos));
+}
+
+function backHtml(back) {
+  if (!back) return '';
+  const head = back.match
+    ? `<div style="color:#065f46;font-weight:600">✅ Смисълът съвпада</div>`
+    : `<div style="color:#991b1b;font-weight:600">❌ Възможно разминаване в смисъла${back.issue ? ': ' + escapeHtml(back.issue) : ''}</div>`;
+  return `${head}<div style="color:#6b7280;margin-top:3px"><span style="font-weight:600">Обратен превод:</span> ${escapeHtml(back.back)}</div>`;
+}
+
+// ── Review panel (after a batch) ──────────────────────────────────────────────
+function showReviewPanel() {
+  document.getElementById('ka-review-panel')?.remove();
+  const panel = document.createElement('div');
+  panel.id = 'ka-review-panel';
+  Object.assign(panel.style, {
+    position:'fixed', top:'60px', left:'20px', width:'420px', maxHeight:'calc(100vh - 90px)',
+    background:'#fff', borderRadius:'12px', boxShadow:'0 10px 40px rgba(0,0,0,0.2)',
+    zIndex:'2147483646', overflow:'hidden', border:'1px solid #e5e7eb', display:'flex', flexDirection:'column',
+    fontFamily:'-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif', fontSize:'13px', color:'#111827',
+  });
+  panel.innerHTML = `
+    <div id="ka-rv-hdr" style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:linear-gradient(135deg,#d97706,#b45309);color:#fff;cursor:move;user-select:none">
+      <div style="font-size:14px;font-weight:700">🟡 За преглед (${_reviewQueue.length})</div>
+      <div style="display:flex;gap:6px">
+        <button id="ka-rv-csv" style="background:rgba(255,255,255,.18);border:none;color:#fff;padding:4px 10px;border-radius:12px;cursor:pointer;font-size:12px">⬇️ CSV</button>
+        <button id="ka-rv-close" style="background:rgba(255,255,255,.18);border:none;color:#fff;width:26px;height:26px;border-radius:50%;cursor:pointer">✕</button>
+      </div>
+    </div>
+    <div id="ka-rv-list" style="overflow:auto;padding:4px 16px 12px"></div>`;
+  document.body.appendChild(panel);
+  makeDraggable(panel, panel.querySelector('#ka-rv-hdr'));
+  panel.querySelector('#ka-rv-close').onclick = () => panel.remove();
+  panel.querySelector('#ka-rv-csv').onclick = downloadQueueCsv;
+
+  const list = panel.querySelector('#ka-rv-list');
+  _reviewQueue.forEach((item, idx) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'padding:10px 0;border-bottom:1px solid #f3f4f6;line-height:1.5';
+    row.innerHTML = `
+      <div style="color:#6b7280;font-size:12px">${idx + 1}. ${escapeHtml(item.source.slice(0, 160))}</div>
+      <div style="margin-top:4px">${highlightFlags(item.text, item.flags)}</div>
+      ${item.flags.map(f => `<div style="font-size:12px;margin-top:3px">• <b>${escapeHtml(f.phrase)}</b> — ${escapeHtml(bgReasonLabel(f.reason))}${f.note ? ': ' + escapeHtml(f.note) : ''}${f.alternatives.length ? ' → <i>' + escapeHtml(f.alternatives.join(' / ')) + '</i>' : ''}</div>`).join('')}
+      ${item.back && !item.back.match ? `<div style="font-size:12px;margin-top:4px;background:#fef2f2;border-radius:6px;padding:6px 8px">${backHtml(item.back)}</div>` : ''}
+      ${item.el ? `<button data-open="${idx}" style="${SMALL_BTN};margin-top:6px">↗ Отвори стринга</button>` : ''}`;
+    list.appendChild(row);
+  });
+  list.querySelectorAll('[data-open]').forEach(b => {
+    b.onclick = () => activateJiptElement(_reviewQueue[Number(b.dataset.open)].el);
+  });
+}
+
+function downloadQueueCsv() {
+  const rows = [['Оригинал', 'Превод', 'Рискови фрази', 'Обратен превод', 'Смисълът съвпада', 'Проблем']];
+  for (const q of _reviewQueue) {
+    rows.push([
+      q.source, q.text,
+      q.flags.map(f => `${f.phrase} (${bgReasonLabel(f.reason)}${f.note ? ': ' + f.note : ''})${f.alternatives.length ? ' → ' + f.alternatives.join(' / ') : ''}`).join('\n'),
+      q.back?.back || '', q.back ? (q.back.match ? 'да' : 'не') : '', q.back?.issue || '',
+    ]);
+  }
+  downloadText(bgCsv(rows), `za-pregled-${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv');
+}
+
+function downloadText(text, filename, type) {
+  const url = URL.createObjectURL(new Blob([text], { type: `${type};charset=utf-8` }));
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ── Check already-translated strings (optional, token-heavy) ──────────────────
+const JIPT_TRANSL_SELS = [
+  '.crowdin_jipt_translated',
+  '.crowdin_jipt_approved',
+  '[class*="crowdin_jipt"]:not(.crowdin_jipt_untransl)',
+];
+
+function getTranslatedElements() {
+  for (const sel of JIPT_TRANSL_SELS) {
+    try {
+      const els = [...document.querySelectorAll(sel)].filter(el => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && !el.classList.contains('crowdin_jipt_untransl');
+      });
+      // Keep only the outermost element when JIPT nodes are nested.
+      const outer = els.filter(el => !els.some(o => o !== el && o.contains(el)));
+      if (outer.length > 0) return outer;
+    } catch(e) {}
+  }
+  return [];
+}
+
+async function checkTranslated() {
+  if (!activeApiKey()) {
+    showToast('⚠️ Проверката изисква API ключ за ИИ доставчик (виж настройките).', 'warn');
+    return;
+  }
+  chrome.storage.sync.get(SETTINGS_KEYS, async result => {
+    applySettings(result);
+    _reviewQueue = [];
+    await runCheckBatch();
+  });
+}
+
+async function runCheckBatch() {
+  const overlay = showProgressOverlay('🔍 Проверка на преведените стрингове');
+  let stopped = false, checked = 0, skipped = 0, errors = 0;
+  overlay.querySelector('#ka-stop-btn').onclick = () => { stopped = true; overlay.remove(); };
+
+  const els = getTranslatedElements();
+  const total = els.length;
+  if (total === 0) {
+    updateProgress(overlay, 0, 0, 'Няма преведени стрингове на тази страница.');
+    showSummary(overlay, 0, 0, 0, 0, 'check');
+    return;
+  }
+
+  if (!findCrowdinIframe()) { await activateJiptElement(els[0]); await sleep(1500); }
+  updateProgress(overlay, 0, total, '⏳ Свързване с редактора на Crowdin…');
+  if (!(await waitForIframe(12000))) {
+    updateProgress(overlay, 0, total, '❌ Редакторът не отговаря — презареди страницата');
+    showSummary(overlay, 0, total, 1, 0, 'check');
+    return;
+  }
+
+  let prevSource = null;
+  for (let i = 0; i < els.length; i++) {
+    if (stopped) return;
+    const el = els[i];
+    updateProgress(overlay, checked, total, `Стринг ${i+1}/${total} — отварям…`);
+    await activateJiptElement(el);
+
+    let state = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await sleep(attempt === 0 ? 900 : 500);
+      state = await iframeCmd('GET_STATE', {}, 4000);
+      const stale = prevSource && state?.source && state.source.slice(0, 60) === prevSource.slice(0, 60);
+      if (state?.hasInput && state?.source && !stale) break;
+    }
+    const source = state?.source || getJiptSourceAttr(el);
+    const existing = (state?.existing || '').trim();
+    if (!source || !existing || !/[^\x00-\x7F]/.test(existing)) {
+      skipped++;
+      continue;
+    }
+    prevSource = source;
+
+    updateProgress(overlay, checked, total, 'Проверявам…', `"${source.slice(0, 55)}"`);
+    try {
+      const r = await reviewExistingTranslation(source, existing, selectedLanguage);
+      checked++;
+      if (r.flags.length || (r.back && !r.back.match)) {
+        _reviewQueue.push({ source, text: existing, flags: r.flags, back: r.back, el });
+      }
+      updateProgress(overlay, checked, total, `Проверени: ${checked} · за преглед: ${_reviewQueue.length}`);
+    } catch (e) {
+      errors++;
+      console.warn('[KAT] Review failed:', e.message);
+    }
+  }
+  showSummary(overlay, checked, total, errors, skipped, 'check');
 }
 
 // ── Floating buttons ──────────────────────────────────────────────────────────
 function injectButtons() {
-  if (document.getElementById('ka-btn-group')) return;
+  if (document.getElementById('ka-btn-group')) { syncCheckBtn(); return; }
   const group = document.createElement('div');
   group.id = 'ka-btn-group';
   Object.assign(group.style, {
@@ -1524,15 +1893,34 @@ function injectButtons() {
     display:'flex', flexDirection:'column', gap:'10px', alignItems:'flex-end',
   });
 
-  const allBtn = makeBtn('⚡ Translate All', 'linear-gradient(135deg,#059669,#0d9488)', translateAll);
-  const singleBtn = makeBtn('🌐 Translate This', 'linear-gradient(135deg,#4f46e5,#7c3aed)', translateThis);
+  // Colours of the Bulgarian flag (white, green, red), blended top to bottom.
+  const allBtn = makeBtn('⚡ Преведи всички',
+    'linear-gradient(180deg,#ffffff 12%,#00966E 50%,#D62612 88%)', translateAll,
+    { textShadow:'0 1px 2px rgba(0,0,0,.85)', border:'1px solid #d1d5db' });
+  const singleBtn = makeBtn('🌐 Преведи този', 'linear-gradient(135deg,#4f46e5,#7c3aed)', translateThis);
 
   group.appendChild(allBtn);
   group.appendChild(singleBtn);
   document.body.appendChild(group);
+  syncCheckBtn();
 }
 
-function makeBtn(label, bg, onClick) {
+// The "check translated" button only shows when enabled in the settings.
+function syncCheckBtn() {
+  const group = document.getElementById('ka-btn-group');
+  if (!group) return;
+  const existing = document.getElementById('ka-check-btn');
+  if (bgSettings.reviewTranslatedBtn && !existing) {
+    const btn = makeBtn('🔍 Провери преведените', 'linear-gradient(135deg,#d97706,#b45309)', checkTranslated);
+    btn.id = 'ka-check-btn';
+    group.appendChild(btn);
+  } else if (!bgSettings.reviewTranslatedBtn && existing) {
+    existing.remove();
+  }
+}
+chrome.storage.onChanged.addListener(c => { if (c.reviewTranslatedBtn) syncCheckBtn(); });
+
+function makeBtn(label, bg, onClick, extraStyle = {}) {
   const btn = document.createElement('button');
   btn.type='button'; btn.textContent=label;
   Object.assign(btn.style, {
@@ -1540,6 +1928,7 @@ function makeBtn(label, bg, onClick) {
     borderRadius:'50px', fontSize:'13px', fontWeight:'700',
     fontFamily:'-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif',
     cursor:'pointer', boxShadow:'0 4px 16px rgba(0,0,0,0.25)', whiteSpace:'nowrap',
+    ...extraStyle,
   });
   btn.addEventListener('mouseenter',()=>{ btn.style.opacity='.9'; btn.style.transform='translateY(-2px)'; });
   btn.addEventListener('mouseleave',()=>{ btn.style.opacity='1'; btn.style.transform='none'; });
@@ -1556,44 +1945,53 @@ async function translateThis() {
     const state = await iframeCmd('GET_STATE', {}, 3000);
     src = state?.source || '';
   }
-  showSinglePanel(src || '(Open a string first, then click Translate This)');
+  showSinglePanel(src || '(Първо отвори стринг, после натисни „Преведи този“)');
 }
+
+const LABEL_STYLE = 'font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px';
+const TA_STYLE = 'width:100%;padding:8px 10px;border:1.5px solid #e5e7eb;border-radius:7px;font-size:13px;font-family:inherit;line-height:1.5;outline:none;resize:vertical;box-sizing:border-box';
+const PANEL_BTN = 'padding:7px 11px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;border:none;background:#f3f4f6;color:#374151;font-family:inherit';
 
 function showSinglePanel(sourceText) {
   document.getElementById('ka-single-panel')?.remove();
   const panel = document.createElement('div');
   panel.id = 'ka-single-panel';
   Object.assign(panel.style, {
-    position:'fixed', top:'60px', right:'20px', width:'360px',
+    position:'fixed', top:'60px', right:'20px', width:'380px', maxHeight:'calc(100vh - 190px)', overflowY:'auto',
     background:'#fff', borderRadius:'12px',
     boxShadow:'0 10px 40px rgba(0,0,0,0.2)',
-    zIndex:'2147483646', overflow:'hidden', border:'1px solid #e5e7eb',
+    zIndex:'2147483646', border:'1px solid #e5e7eb',
     fontFamily:'-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif',
   });
   panel.innerHTML = `
     <div id="ka-sp-hdr" style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;cursor:move;user-select:none">
-      <div style="font-size:14px;font-weight:700">🌐 Translate <span style="font-size:10px;background:rgba(255,255,255,.2);padding:2px 8px;border-radius:20px;margin-left:6px">${activeApiKey() ? providerLabel() : 'Google'}</span></div>
+      <div style="font-size:14px;font-weight:700">🌐 Превод <span style="font-size:10px;background:rgba(255,255,255,.2);padding:2px 8px;border-radius:20px;margin-left:6px">${activeApiKey() ? providerLabel() : 'Google'}</span></div>
       <button id="ka-sp-close" style="background:rgba(255,255,255,.15);border:none;color:#fff;width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:13px">✕</button>
     </div>
     <div style="padding:12px 16px 0">
-      <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Language</div>
+      <div style="${LABEL_STYLE}">Език</div>
       <select id="ka-sp-lang" style="width:100%;padding:8px 10px;border:1.5px solid #e5e7eb;border-radius:7px;font-size:13px;background:#fafafa;outline:none;cursor:pointer">
         ${Object.entries(LANGUAGES).map(([c,n])=>`<option value="${c}"${c===selectedLanguage?' selected':''}>${n}</option>`).join('')}
       </select>
     </div>
     <div style="padding:12px 16px 0">
-      <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Source (English)</div>
-      <textarea id="ka-sp-src" rows="3" style="width:100%;padding:8px 10px;border:1.5px solid #e5e7eb;border-radius:7px;font-size:13px;font-family:inherit;line-height:1.5;outline:none;resize:vertical;box-sizing:border-box;background:#f9fafb">${escapeHtml(sourceText)}</textarea>
+      <div style="${LABEL_STYLE}">Оригинал (английски)</div>
+      <textarea id="ka-sp-src" rows="3" style="${TA_STYLE};background:#f9fafb">${escapeHtml(sourceText)}</textarea>
     </div>
     <div style="padding:12px 16px 0">
-      <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Translation</div>
-      <textarea id="ka-sp-result" rows="4" style="width:100%;padding:8px 10px;border:1.5px solid #e5e7eb;border-radius:7px;font-size:13px;font-family:inherit;line-height:1.5;outline:none;resize:vertical;box-sizing:border-box" placeholder="Translation will appear here..."></textarea>
+      <div style="${LABEL_STYLE}">Превод</div>
+      <textarea id="ka-sp-result" rows="4" style="${TA_STYLE}" placeholder="Тук ще се появи преводът…"></textarea>
     </div>
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 14px;gap:8px">
-      <button id="ka-sp-go" style="padding:7px 13px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;border:none;background:#f3f4f6;color:#374151;font-family:inherit">🔄 Translate</button>
-      <div style="display:flex;gap:8px">
-        <button id="ka-sp-copy" style="padding:7px 13px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;border:none;background:#f3f4f6;color:#374151;font-family:inherit">📋 Copy</button>
-        <button id="ka-sp-insert" style="padding:7px 13px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;border:none;background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;font-family:inherit">✅ Insert & Save</button>
+    <div id="ka-sp-flags" style="display:none;margin:10px 16px 0;padding:10px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;font-size:12px;line-height:1.5;color:#111827"></div>
+    <div id="ka-sp-back" style="display:none;margin:10px 16px 0;padding:10px 12px;border-radius:8px;font-size:12px;line-height:1.5"></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 14px;gap:6px;flex-wrap:wrap">
+      <div style="display:flex;gap:6px">
+        <button id="ka-sp-go" style="${PANEL_BTN}">🔄 Преведи</button>
+        <button id="ka-sp-check" style="${PANEL_BTN}" title="Провери текущия превод за рискови фрази и смисъл (1 заявка към ИИ)">🔍 Провери</button>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button id="ka-sp-copy" style="${PANEL_BTN}">📋 Копирай</button>
+        <button id="ka-sp-insert" style="${PANEL_BTN};background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff">✅ Вмъкни и запиши</button>
       </div>
     </div>
   `;
@@ -1602,48 +2000,126 @@ function showSinglePanel(sourceText) {
   makeDraggable(panel, document.getElementById('ka-sp-hdr'));
   document.getElementById('ka-sp-close').onclick = () => panel.remove();
 
+  const resultEl = document.getElementById('ka-sp-result');
+  const flagsEl = document.getElementById('ka-sp-flags');
+  const backEl = document.getElementById('ka-sp-back');
+  let aiText = '';     // last AI output — the baseline for learning corrections
+  let flags = [];      // risky phrases currently shown
+  let accepted = 0;    // alternatives the translator picked with one click
+
+  const renderFlags = () => {
+    if (!flags.length) { flagsEl.style.display = 'none'; return; }
+    const text = resultEl.value;
+    flagsEl.style.display = 'block';
+    flagsEl.innerHTML = `
+      <div style="font-weight:700;color:#92400e;margin-bottom:6px">🟡 Рискови фрази (${flags.length})</div>
+      <div style="background:#fff;border-radius:6px;padding:6px 8px;margin-bottom:6px;white-space:pre-wrap">${highlightFlags(text, flags)}</div>
+      ${flags.map((f, i) => {
+        const resolved = !text.includes(f.phrase);
+        return `<div style="margin-top:6px;${resolved ? 'opacity:.55' : ''}">
+          ${resolved ? '✓ ' : ''}<b>${escapeHtml(f.phrase)}</b>
+          <span style="background:#fef3c7;border-radius:10px;padding:0 6px;margin-left:4px">${escapeHtml(bgReasonLabel(f.reason))}</span>
+          ${f.note ? `<div style="color:#4b5563">${escapeHtml(f.note)}</div>` : ''}
+          ${!resolved && f.alternatives.length ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:3px">${f.alternatives.map((a, j) =>
+            `<button data-f="${i}" data-a="${j}" title="Замени в превода" style="padding:2px 8px;border-radius:10px;border:1px solid #d97706;background:#fff;color:#92400e;cursor:pointer;font-size:12px;font-family:inherit">${escapeHtml(a)}</button>`).join('')}</div>` : ''}
+        </div>`;
+      }).join('')}`;
+    flagsEl.querySelectorAll('button[data-f]').forEach(b => {
+      b.onclick = () => {
+        const f = flags[Number(b.dataset.f)];
+        resultEl.value = resultEl.value.replace(f.phrase, f.alternatives[Number(b.dataset.a)]);
+        accepted++;
+        renderFlags();
+      };
+    });
+  };
+  resultEl.addEventListener('input', renderFlags);
+
+  const renderBack = (back) => {
+    if (!back) { backEl.style.display = 'none'; return; }
+    backEl.style.display = 'block';
+    backEl.style.background = back.match ? '#ecfdf5' : '#fef2f2';
+    backEl.style.border = `1px solid ${back.match ? '#a7f3d0' : '#fecaca'}`;
+    backEl.innerHTML = backHtml(back);
+  };
+
   const doTranslate = async () => {
     const lang = document.getElementById('ka-sp-lang').value;
     selectedLanguage = lang;
     chrome.storage.sync.set({ targetLanguage: lang });
     const src = document.getElementById('ka-sp-src').value.trim();
-    const r = document.getElementById('ka-sp-result');
     const b = document.getElementById('ka-sp-go');
-    r.value=''; r.placeholder='⏳ Translating…'; b.disabled=true; b.textContent='⏳…';
+    resultEl.value=''; resultEl.placeholder='⏳ Превеждам…'; b.disabled=true; b.textContent='⏳…';
+    flags = []; accepted = 0; renderFlags(); renderBack(null);
     try {
-      r.value = await translateText(src, lang);
-      r.placeholder='Translation will appear here...';
-    } catch(e) { r.placeholder=`❌ ${e.message}`; }
-    finally { b.disabled=false; b.textContent='🔄 Translate'; }
+      const r = await translateTextDetailed(src, lang, { single: true });
+      resultEl.value = r.text;
+      aiText = r.text;
+      flags = r.flags;
+      renderFlags();
+      renderBack(r.back);
+      bgStat(s => { s.stringsTranslated++; s.flagsShown += r.flags.length; });
+      resultEl.placeholder='Тук ще се появи преводът…';
+    } catch(e) { resultEl.placeholder=`❌ ${e.message}`; }
+    finally { b.disabled=false; b.textContent='🔄 Преведи'; }
+  };
+
+  const doCheck = async () => {
+    const t = resultEl.value.trim();
+    const src = document.getElementById('ka-sp-src').value.trim();
+    if (!t || !src) return;
+    if (!activeApiKey()) { showToast('⚠️ Проверката изисква API ключ за ИИ доставчик.', 'warn'); return; }
+    const b = document.getElementById('ka-sp-check');
+    b.disabled = true; b.textContent = '⏳…';
+    try {
+      const r = await reviewExistingTranslation(src, t, document.getElementById('ka-sp-lang').value);
+      flags = r.flags; accepted = 0;
+      renderFlags();
+      renderBack(r.back);
+      if (!r.flags.length && (!r.back || r.back.match)) showToast('✅ Не открих рискови места.', 'success');
+    } catch (e) { showToast(`⚠️ ${e.message}`, 'warn'); }
+    finally { b.disabled = false; b.textContent = '🔍 Провери'; }
+  };
+
+  // Learn from the translator's edits and record flag statistics before saving.
+  const learn = async (finalText) => {
+    bgStatFlagOutcome(flags, finalText, accepted);
+    if (aiText && finalText !== aiText) {
+      bgStat(s => { s.editedBeforeSave++; });
+      const pairs = await bgRecordCorrections(aiText, finalText, document.getElementById('ka-sp-src').value);
+      if (pairs.length) return ` 🧠 Запомних: ${pairs.map(p => `${p.from} → ${p.to}`).join('; ').slice(0, 100)}`;
+    }
+    return '';
   };
 
   document.getElementById('ka-sp-go').onclick = doTranslate;
+  document.getElementById('ka-sp-check').onclick = doCheck;
   document.getElementById('ka-sp-copy').onclick = () => {
-    const t = document.getElementById('ka-sp-result').value;
+    const t = resultEl.value;
     if (!t) return;
     navigator.clipboard.writeText(t).then(() => {
       const b = document.getElementById('ka-sp-copy');
-      b.textContent='✅ Copied!'; setTimeout(()=>{ b.textContent='📋 Copy'; },2000);
+      b.textContent='✅ Копирано'; setTimeout(()=>{ b.textContent='📋 Копирай'; },2000);
     });
   };
   document.getElementById('ka-sp-insert').onclick = async () => {
-    const t = document.getElementById('ka-sp-result').value;
+    const t = resultEl.value;
     if (!t) return;
     // Try top frame first
     const topInput = findTopFrameTranslationInput();
     if (topInput) {
       await insertInTopFrame(topInput, t);
-      showToast('✅ Inserted & saved!', 'success');
+      showToast('✅ Вмъкнато и записано!' + await learn(t), 'success');
       panel.remove();
       return;
     }
     // Fall back to iframe
     const result = await iframeCmd('INSERT_SAVE', { text: t }, 5000);
     if (result?.ok) {
-      showToast('✅ Inserted & saved!', 'success');
+      showToast('✅ Вмъкнато и записано!' + await learn(t), 'success');
       panel.remove();
     } else {
-      showToast('⚠️ Could not insert — click a string first, then try Insert & Save', 'warn');
+      showToast('⚠️ Не успях да вмъкна — избери стринг и опитай пак „Вмъкни и запиши“', 'warn');
     }
   };
   if (sourceText && !sourceText.startsWith('(')) doTranslate();
@@ -1660,10 +2136,10 @@ function showToast(msg, type) {
     padding:'10px 18px', borderRadius:'8px', fontSize:'13px', fontWeight:'500',
     zIndex:'2147483647', fontFamily:'inherit', boxShadow:'0 4px 14px rgba(0,0,0,.15)',
     background:type==='success'?'#d1fae5':'#fef3c7',
-    color:type==='success'?'#065f46':'#92400e',
+    color:type==='success'?'#065f46':'#92400e', maxWidth:'80vw',
   });
   t.textContent=msg; document.body.appendChild(t);
-  setTimeout(()=>t.remove(), 3000);
+  setTimeout(()=>t.remove(), 4500);
 }
 function makeDraggable(panel, handle) {
   let sx,sy,sl,st;
